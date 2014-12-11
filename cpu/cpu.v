@@ -9,8 +9,8 @@ module cpu(
     output wire [63:0] ram_dout,
     output wire [7:0]  ram_mask,
     output wire [27:0] ram_addr,
-    output reg ram_we,
-    output reg ram_re
+    output wire ram_we,
+    output wire ram_re
 );
 
     parameter STATE_INVALID         = 0;
@@ -35,7 +35,6 @@ module cpu(
     reg [47:0] opcode;      // Current instruction.
     reg [31:0] operand;     // Operand for RX instructions.
     reg alu_ready;          // ALU result is ready.
-    reg data_ready;         // Load/Store complete.
     wire split_transfer;    // Load/ltore not on a 64-bit boundary.
     reg transfer2;          // Transfer second part of a split.
 
@@ -82,6 +81,8 @@ module cpu(
     wire [3:0] rx_base = opcode[19:16];
     wire [11:0] rx_displacement = opcode[31:20];
     wire [31:0] rx_addr = rx_index + rx_base + rx_displacement;
+    wire ah = opcode[15:8] == 8'h4A;    // Add Halfword
+    wire sh = opcode[15:8] == 8'h4B;    // Subtract Halfword
     wire sth = opcode[15:8] == 8'h40;   // STore Halfword
     wire stc = opcode[15:8] == 8'h42;   // STore Character
     wire bal = opcode[15:8] == 8'h45;   // Branch And Link
@@ -109,8 +110,10 @@ module cpu(
     wire slda = opcode[15:8] == 8'h8F;  // Shift Left Double Arithmetic
     wire stm = opcode[15:8] == 8'h90;   // STore Multiple
     wire lm = opcode[15:8] == 8'h98;    // Load Multiple
+    wire cs = opcode[15:8] == 8'hBA;    // Compare and Swap
+    wire cds = opcode[15:8] == 8'hBB;   // Compare Double and Swap
     wire type_rs = bxh | bxle | srl | sll | sra | sla | srdl | sldl
-                 | srda | slda | stm | lm;
+                 | srda | slda | stm | lm | cs | cds;
     wire rs_store = stm;
     wire rs_branch = bxh | bxle;
     wire rs_load = ~rs_store & ~rs_branch;
@@ -136,6 +139,8 @@ module cpu(
                  | ni | cli | oi | xi | sio | tio | hio | tch;
 
     // SS Instructions (3 halfwords).
+    wire nc = opcode[15:8] == 8'hD4;        // aNd Character
+    wire xc = opcode[15:8] == 8'hD7;        // Xor Character
     wire type_ss = opcode[15:14] == 2'b11;
 
     // Instruction size (in bytes).
@@ -144,6 +149,7 @@ module cpu(
     wire size6 = type_ss;
 
     // Determine the next state.
+    wire transfer_done = ram_ready & ~split_transfer | transfer2;
     reg [7:0] next_state;
     always @(*) begin
         next_state <= STATE_INVALID;
@@ -151,15 +157,19 @@ module cpu(
             STATE_INIT:         next_state <= STATE_FETCH1;
             STATE_FETCH1:
                 if (ram_ready) begin
-                    case (1'b1)
-                        type_rr:    next_state <= STATE_EXEC_RR;
-                        default:    next_state <= STATE_FETCH2;
-                    endcase
+                    // Instruction opcode not yet decoded, so we use
+                    // the current memory input.
+                    if (current_hw[15:14] == 2'b00) begin
+                        next_state <= STATE_EXEC_RR;
+                    end else begin
+                        next_state <= STATE_FETCH2;
+                    end
                 end else begin
                     next_state <= STATE_FETCH1;
                 end
             STATE_FETCH2:
                 if (ram_ready) begin
+                    // At this point, the opcode will be decoded.
                     case (1'b1)
                         type_rs:    next_state <= STATE_EXEC_RS;
                         type_rx:    next_state <= STATE_LOAD_RX;
@@ -178,13 +188,13 @@ module cpu(
                 else next_state <= STATE_EXEC_RR;
             STATE_SAVE_RR:      next_state <= STATE_FETCH1;
             STATE_LOAD_RX:
-                if (~rx_load || data_ready) next_state <= STATE_EXEC_RX;
+                if (~rx_load | transfer_done) next_state <= STATE_EXEC_RX;
                 else next_state <= STATE_LOAD_RX;
             STATE_EXEC_RX:
                 if (alu_ready)  next_state <= STATE_SAVE_RX;
                 else next_state <= STATE_EXEC_RX;
             STATE_SAVE_RX:
-                if (~rx_store || data_ready) next_state <= STATE_FETCH1;
+                if (~rx_store | transfer_done) next_state <= STATE_FETCH1;
                 else next_state <= STATE_SAVE_RX;
         endcase
     end
@@ -193,40 +203,54 @@ module cpu(
     always @(posedge clk) begin
         if (rst) begin
             state <= STATE_INIT;
-            pc <= 0;
         end else begin
             state <= next_state;
         end
     end
 
     // Demux the current halfword (for instruction fetches).
+    // Note that reading on non-halfword boundaries is an exception.
     reg [15:0] current_hw;
     always @(*) begin
-        case (pc[1:0])
-            2'b00:  current_hw <= ram_din[63:48];
-            2'b01:  current_hw <= ram_din[47:32];
-            2'b10:  current_hw <= ram_din[31:16];
-            2'b11:  current_hw <= ram_din[15:0];
+        case (pc[2:0])
+            3'b000:     current_hw <= ram_din[63:48];
+            3'b010:     current_hw <= ram_din[47:32];
+            3'b100:     current_hw <= ram_din[31:16];
+            3'b110:     current_hw <= ram_din[15:0];
         endcase
     end
 
     // Instruction fetch.
     always @(posedge clk) begin
-        case (next_state)
-            STATE_FETCH1: opcode[15:0]  <= current_hw;
-            STATE_FETCH2: opcode[31:16] <= current_hw;
-            STATE_FETCH3: opcode[47:32] <= current_hw;
-        endcase
+        if (ram_ready) begin
+            case (state)
+                STATE_FETCH1: opcode[15:0]  <= current_hw;
+                STATE_FETCH2: opcode[31:16] <= current_hw;
+                STATE_FETCH3: opcode[47:32] <= current_hw;
+            endcase
+        end
     end
 
     // Update program counter.
+    reg [31:0] next_pc;
+    always @(*) begin
+        if (ram_ready) begin
+            case (state)
+                STATE_FETCH1:   next_pc <= pc + 2;
+                STATE_FETCH2:   next_pc <= pc + 2;
+                STATE_FETCH3:   next_pc <= pc + 2;
+                default:        next_pc <= pc;
+            endcase
+        end else begin
+            next_pc <= pc;
+        end
+    end
     always @(posedge clk) begin
-        case (next_state)
-            STATE_FETCH1:   pc <= pc + 2;
-            STATE_FETCH2:   pc <= pc + 2;
-            STATE_FETCH3:   pc <= pc + 2;
-            default:        pc <= pc;
-        endcase
+        if (rst) begin
+            pc <= 0;
+        end else begin
+            pc <= next_pc;
+        end
     end
 
     // Build up the PSW.
@@ -333,10 +357,33 @@ module cpu(
 
     // ALU.
     reg [63:0] alu_result;
-    always @(posedge clk) begin
+    reg [1:0] alu_cond;
+    always @(*) begin
         case (alu_func)
             ALU_ADD:    alu_result <= alu_in_a + alu_in_b;
+            ALU_ADDL:   alu_result <= alu_in_a + alu_in_b;
+            ALU_AND:    alu_result <= alu_in_a & alu_in_b;
             ALU_MUL:    alu_result <= mul_result;
+        endcase
+    end
+    always @(*) begin
+        case (alu_func)
+            ALU_ADD:
+                if (ah && alu_result[15] != alu_result[16])
+                    alu_cond <= 3;
+                else if (~ah && alu_result[31] != alu_result[32])
+                    alu_cond <= 3;
+                else if (alu_result[15]) alu_cond <= 1;
+                else if (alu_result[14:0] != 0) alu_cond <= 2;
+                else alu_cond <= 0;
+            ALU_ADDL:
+                begin
+                    alu_cond[1] <= alu_result[32];
+                    alu_cond[0] <= alu_result[31:0] == 0;
+                end
+            ALU_AND:
+                if (nc | ni)    alu_cond[0] <= alu_result[7:0] != 0;
+                else            alu_cond[0] <= alu_result[31:0] != 0;
         endcase
     end
     always @(*) begin
@@ -345,27 +392,18 @@ module cpu(
             default:    alu_ready <= 1;
         endcase
     end
+    wire add_word_overflow = alu_result[31] != alu_result[32];
+    wire add_hw_overflow = alu_result[15] != alu_result[16];
 
-    // ALU result.
+    // ALU result and condition code.
     always @(posedge clk) begin
         case (next_state)
-            STATE_SAVE_RR:  gpr[rr_r1] <= alu_result[31:0];
+            STATE_SAVE_RR:
+                begin
+                    gpr[rr_r1] <= alu_result[31:0];
+                    cond_code  <= alu_cond;
+                end
         endcase
-    end
-
-    // Drive memory read/write.
-    always @(*) begin
-        ram_re <= 0;
-        ram_we <= 0;
-        if (ram_ready) begin
-            case (next_state)
-                STATE_FETCH1:   ram_re <= 1;
-                STATE_FETCH2:   ram_re <= 1;
-                STATE_FETCH3:   ram_re <= 1;
-                STATE_LOAD_RX:  ram_re <= rx_load;
-                STATE_SAVE_RX:  ram_we <= rx_store;
-            endcase
-        end
     end
 
     // Determine the memory access size.
@@ -373,11 +411,19 @@ module cpu(
     reg [3:0] access_bytes;
     always @(*) begin
         case (1'b1)
+            nc:         access_bytes <= 1;
+            ni:         access_bytes <= 1;
+            xc:         access_bytes <= 1;
+            xi:         access_bytes <= 1;
             stc:        access_bytes <= 1;
+            ah:         access_bytes <= 2;
             sth:        access_bytes <= 2;
-            st:         access_bytes <= 4;
-            ste:        access_bytes <= 4;
-            stm:        access_bytes <= 4;
+            sh:         access_bytes <= 2;
+            cds:        access_bytes <= 8;
+            slda:       access_bytes <= 8;
+            sldl:       access_bytes <= 8;
+            srda:       access_bytes <= 8;
+            srdl:       access_bytes <= 8;
             default:    access_bytes <= 4;
         endcase
     end
@@ -386,9 +432,9 @@ module cpu(
     reg [31:0] full_addr;
     always @(*) begin
         case (next_state)
-            STATE_LOAD_RX:  full_addr <= rx_addr;
-            STATE_SAVE_RX:  full_addr <= rx_addr;
-            default:        full_addr <= pc;
+            STATE_LOAD_RX:  full_addr <= rx_addr[31:3];
+            STATE_SAVE_RX:  full_addr <= rx_addr[31:3];
+            default:        full_addr <= pc[31:3];
         endcase
     end
     assign ram_addr = transfer2 ? (full_addr + 1) : full_addr;
@@ -413,30 +459,65 @@ module cpu(
     wire [4:0] next_addr = full_addr[3:0] + transfer_bytes;
     assign split_transfer = next_addr[4] != full_addr[4];
 
-    // Drive memory data output and mask.
+    // Select the data to write.
+    // This is left-aligned.
+    reg [63:0] dout_unshifted;
+    reg [7:0] mask_unshifted;
     always @(*) begin
-        if (transfer2) begin
-            
-        end else begin
-        end
+        dout_unshifted <= {alu_result[31:0], 32'b0};
+        mask_unshifted <= 8'b11110000;
     end
 
-    // Drive memory output.
-    assign ram_dout = alu_result[31:0];
+    // Shift the data and mask for output.
+    reg [63:0] dout_shifted;
+    reg [7:0] mask_shifted;
+    genvar shift_i;
+    generate
+        for (shift_i = 0; shift_i < 8; shift_i = shift_i + 1) begin
+            always @(*) begin
+                if (transfer2) begin
+                    if (full_addr[2:0] == 7 - shift_i) begin
+                        dout_shifted <=
+                            {dout_unshifted[63-8*shift_i:0], {shift_i{8'bz}}};
+                        mask_shifted <=
+                            {mask_unshifted[7-shift_i:0], {shift_i{1'b0}}};
+                    end
+                end else begin
+                    if (full_addr[2:0] == shift_i) begin
+                        dout_shifted <=
+                            {{shift_i{8'bz}}, dout_unshifted[63:8*shift_i]};
+                        mask_shifted <=
+                            {{shift_i{1'b0}}, mask_unshifted[7:shift_i]};
+                    end
+                end
+            end
+        end
+    endgenerate
+
+    // Determine if a memory transfer should be started.
+    reg start_read;
+    reg start_write;
+    always @(*) begin
+        start_read <= 0;
+        start_write <= 0;
+        case (next_state)
+            STATE_FETCH1:   start_read <= 1;
+            STATE_FETCH2:   start_read <= 1;
+            STATE_FETCH3:   start_read <= 1;
+            STATE_LOAD_RX:  start_read <= rx_load;
+            STATE_SAVE_RX:  start_write <= rx_store;
+        endcase
+    end
 
     // Handle memory transfers.
     always @(posedge clk) begin
         if (rst) begin
             transfer2 <= 0;
-            data_ready <= 1;
         end else if (ram_ready) begin
-            if (split_transfer && transfer2) begin
-                data_ready <= 1;
-            end else if (split_transfer) begin
-                data_ready <= 0;
-                transfer2 <= 1;
-            end
+            transfer2 <= split_transfer & ~transfer2;
         end
     end
+    assign ram_re = start_read & ram_ready;
+    assign ram_we = start_write & ram_ready;
 
 endmodule

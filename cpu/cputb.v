@@ -55,7 +55,9 @@ module cputb;
                 0:          data_m2c <= 64'h1E12_1423_0000_0000;
                 default:    data_m2c <= ram[data_addr];
             endcase
+            $display("read %x", data_addr);
         end else if (data_we) begin
+            $display("write %x: %x", data_addr, data_c2m);
             data_ready <= 0;
             ram_wb <= 1;
             ram_addr <= data_addr;
