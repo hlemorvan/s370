@@ -3,7 +3,7 @@
 
 module cputb;
 
-    integer i;
+    integer i, j;
     reg clk;
     reg rst;
     reg [63:0] data_m2c;
@@ -14,16 +14,34 @@ module cputb;
     wire data_we;
     reg data_ready;
 
+    reg [63:0] ram [0:255];
+    reg [7:0] program [0:2047];
+
     initial begin
+
+        // Load the program.
+        $readmemh("test.hex", program);
+        for (i = 0; i < 256; i = i + 1) begin
+            ram[i][63:56] <= program[i * 8 + 0];
+            ram[i][55:48] <= program[i * 8 + 1];
+            ram[i][47:40] <= program[i * 8 + 2];
+            ram[i][39:32] <= program[i * 8 + 3];
+            ram[i][31:24] <= program[i * 8 + 4];
+            ram[i][23:16] <= program[i * 8 + 5];
+            ram[i][15:8]  <= program[i * 8 + 6];
+            ram[i][7:0]   <= program[i * 8 + 7];
+        end
 
         $dumpvars;
 
+        // Reset
         clk <= 0;
         rst <= 1;
         #10 clk <= 1;
         #10 clk <= 0;
         rst <= 0;
 
+        // Run for a bit.
         for(i = 0; i < 100; i = i + 1) begin
             #10 clk <= ~clk;
         end
@@ -41,7 +59,6 @@ module cputb;
         .ram_ready(data_ready)
     );
 
-    reg [63:0] ram [1:256];
     reg ram_wb;
     reg [63:0] ram_word;
     reg [27:0] ram_addr;
@@ -51,10 +68,7 @@ module cputb;
             ram_wb = 0;
         end else if (data_re) begin
             data_ready <= 0;
-            case (data_addr)
-                0:          data_m2c <= 64'h1E12_1423_0000_0000;
-                default:    data_m2c <= ram[data_addr];
-            endcase
+            data_m2c <= ram[data_addr];
             $display("read %x", data_addr);
         end else if (data_we) begin
             $display("write %x: %x", data_addr, data_c2m);
@@ -69,14 +83,16 @@ module cputb;
         end
     end
 
-    genvar j;
-    for (j = 0; j < 8; j = j + 1) generate
+    genvar mask_i;
+    for (mask_i = 0; mask_i < 8; mask_i = mask_i + 1) generate
         always @(posedge clk) begin
             if (data_we) begin
-                if (data_mask[j]) begin
-                    ram_word[j * 8 + 7:j * 8] = data_c2m[j * 8 + 7:j * 8];
+                if (data_mask[mask_i]) begin
+                    ram_word[mask_i * 8 + 7:mask_i * 8]
+                        = data_c2m[mask_i * 8 + 7:mask_i * 8];
                 end else begin
-                    ram_word[j * 8 + 7:j * 8] = ram[data_addr][j * 8 + 7:j * 8];
+                    ram_word[mask_i * 8 + 7:mask_i * 8]
+                        = ram[data_addr][mask_i * 8 + 7:mask_i * 8];
                 end
             end
         end
